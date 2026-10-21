@@ -1,21 +1,32 @@
 ;;; mcp_dispatch.lsp — File-based IPC dispatcher for AutoCAD MCP v3.2
 ;;;
 ;;; Protocol:
-;;;   1. Python writes command JSON to C:/temp/autocad_mcp_cmd_{id}.json
-;;;   2. Python types "(c:mcp-dispatch)" + Enter
+;;;   1. Python writes command JSON to <ipc-dir>/autocad_mcp_cmd_{id}.json
+;;;   2. Python types "(c:mcp-dispatch)" + Enter (Windows) or MCPD + Return (Mac)
 ;;;   3. This function reads cmd, dispatches via command map, writes result JSON
-;;;   4. Python polls for C:/temp/autocad_mcp_result_{id}.json
+;;;   4. Python polls for <ipc-dir>/autocad_mcp_result_{id}.json
 ;;;
 ;;; SECURITY: No raw eval — dispatcher uses a command whitelist/map.
-;;; Compatible with AutoCAD LT 2024+.
+;;; Compatible with AutoCAD LT 2024+ (Windows) and full AutoCAD for Mac.
 
 ;; Load dependencies
 (if (not report-error)
   (defun report-error (msg) (princ (strcat "\nERROR: " msg)))
 )
 
-;; IPC directory
-(setq *mcp-ipc-dir* "C:/temp/")
+;; IPC directory: must match AUTOCAD_MCP_IPC_DIR on the Python side.
+;; Env var wins; else C:/temp/ on Windows, /tmp/autocad_mcp/ on Mac.
+(defun mcp-default-ipc-dir ( / d)
+  (setq d (getenv "AUTOCAD_MCP_IPC_DIR"))
+  (cond
+    ((and d (> (strlen d) 0))
+     (if (member (substr d (strlen d) 1) '("/" "\\")) d (strcat d "/")))
+    ((and (not (getenv "WINDIR")) (vl-file-directory-p "/Applications"))
+     "/tmp/autocad_mcp/")
+    (T "C:/temp/")
+  )
+)
+(setq *mcp-ipc-dir* (mcp-default-ipc-dir))
 
 ;; -----------------------------------------------------------------------
 ;; JSON-like output helpers (minimal, no external library)
@@ -1425,6 +1436,10 @@
   )
   (princ)
 )
+
+;; Vowel-free alias typed by the Mac trigger: Vietnamese Telex/VNI input
+;; sources would rewrite "mcp-dispatch" while it is being typed.
+(defun c:MCPD () (c:mcp-dispatch))
 
 ;; -----------------------------------------------------------------------
 ;; Utility helpers (defined if not already loaded from external files)

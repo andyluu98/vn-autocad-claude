@@ -7,6 +7,7 @@ Two backends, one API:
 | Backend | Runtime | Requires AutoCAD? | Screenshot |
 |---------|---------|-------------------|------------|
 | **File IPC** | Windows Python | Yes — AutoCAD LT 2024+ (Windows) | Win32 PrintWindow |
+| **File IPC (macOS, experimental)** | macOS Python | Yes, full AutoCAD for Mac | `screencapture` |
 | **ezdxf** | Any platform | No (headless) | matplotlib render |
 
 The server exposes **8 consolidated tools** (`drawing`, `entity`, `layer`, `block`, `annotation`, `pid`, `view`, `system`) over the MCP stdio transport. An MCP client (Claude Desktop, Claude Code, etc.) connects and drives AutoCAD through natural-language requests.
@@ -19,6 +20,8 @@ The server exposes **8 consolidated tools** (`drawing`, `entity`, `layer`, `bloc
 - **uv** package manager ([install guide](https://docs.astral.sh/uv/getting-started/installation/))
 
 > The ezdxf headless backend works on any platform (Linux, macOS, WSL) for offline DXF generation without AutoCAD installed.
+>
+> On a Mac with **full AutoCAD for Mac**, see [macOS (AutoCAD for Mac)](#macos-autocad-for-mac) to drive the live drawing.
 
 ## Quick Start
 
@@ -89,6 +92,67 @@ system(operation="status")
 
 You should see `backend: "file_ipc"` if AutoCAD is running, or `backend: "ezdxf"` for headless mode.
 
+## macOS (AutoCAD for Mac)
+
+> **Experimental.** Built on Autodesk's documented AutoLISP support for Mac (every `vl-*` function the dispatcher uses is listed as "Windows and Mac OS") and covered by mocked tests. Please report results on real Macs.
+
+Requirements:
+
+- **Full AutoCAD for Mac** (not AutoCAD LT for Mac, which has no AutoLISP).
+- macOS Python 3.10+ and **uv**.
+
+How it works: AutoCAD for Mac has no COM and no Win32 messages, so the server writes the command JSON to `/tmp/autocad_mcp/`, briefly brings AutoCAD to the front, types the `MCPD` command through System Events (`osascript`), then returns focus to the app you were using. `MCPD` is a vowel-free alias of `(c:mcp-dispatch)`, so Vietnamese Telex/VNI input sources cannot rewrite it while it is typed.
+
+### 1. Install
+
+```bash
+git clone https://github.com/andyluu98/vn-autocad-claude.git
+cd vn-autocad-claude
+uv sync
+```
+
+### 2. Load the dispatcher in AutoCAD for Mac
+
+Type `APPLOAD`, choose `lisp-code/mcp_dispatch.lsp`, click **Load** (add it to the Startup Suite to load it with every drawing). The command line should show `IPC directory: /tmp/autocad_mcp/`.
+
+### 3. Grant macOS permissions
+
+In **System Settings > Privacy & Security**, enable for the app that launches the MCP server (Terminal, iTerm, VS Code or Claude):
+
+| Permission | Needed for |
+|---|---|
+| **Accessibility** | Typing `MCPD` into AutoCAD (required) |
+| **Automation > System Events** | Asked on first run, click **OK** (required) |
+| **Screen Recording** | `get_screenshot` only |
+
+Restart that app after granting permissions.
+
+### 4. Configure your MCP client
+
+```json
+{
+  "mcpServers": {
+    "autocad-mcp": {
+      "command": "/path/to/vn-autocad-claude/.venv/bin/python",
+      "args": ["-m", "autocad_mcp"],
+      "env": { "AUTOCAD_MCP_BACKEND": "auto" }
+    }
+  }
+}
+```
+
+Or with Claude Code:
+
+```bash
+claude mcp add autocad-mcp -- /path/to/vn-autocad-claude/.venv/bin/python -m autocad_mcp
+```
+
+### Notes for Mac
+
+- Each command switches to AutoCAD for a fraction of a second; avoid typing in another app while a batch runs. Prefer `batch` for many entities (one switch for the whole batch).
+- Keep a drawing open and the command line idle (no open dialog), as on Windows.
+- Not yet verified on Mac: `plot_pdf` (uses the `DWG To PDF.pc3` plotter) and the P&ID library path `C:\PIDv4-CTO\`.
+
 ## Tools
 
 ### `drawing` — File/drawing management
@@ -149,7 +213,7 @@ You should see `backend: "file_ipc"` if AutoCAD is running, or `backend: "ezdxf"
 | `zoom_window` | Zoom to a specified window |
 | `get_screenshot` | Capture current AutoCAD view as PNG |
 
-Screenshots use `PrintWindow` (Win32) for the File IPC backend — works even when AutoCAD is minimized or in the background. The ezdxf backend renders via matplotlib.
+Screenshots use `PrintWindow` (Win32) for the File IPC backend, which works even when AutoCAD is minimized or in the background. On macOS they use `screencapture` on AutoCAD's front window (AutoCAD is brought to the front first). The ezdxf backend renders via matplotlib.
 
 ### `system` — Server management
 
@@ -168,6 +232,9 @@ Python MCP Server (autocad_mcp)
     ├── File IPC Backend ──► C:/temp/*.json ──► mcp_dispatch.lsp (AutoCAD LT)
     │   PostMessageW(WM_CHAR) to MDIClient — no focus steal
     │
+    ├── File IPC Backend (macOS) ──► /tmp/autocad_mcp/*.json ──► mcp_dispatch.lsp (AutoCAD for Mac)
+    │   osascript types MCPD, then restores focus
+    │
     └── ezdxf Backend ──► in-memory DXF (headless, no AutoCAD needed)
 ```
 
@@ -178,11 +245,11 @@ The File IPC backend sends keystrokes to AutoCAD's MDIClient window via `PostMes
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AUTOCAD_MCP_BACKEND` | `auto` | Backend selection: `auto`, `file_ipc`, `ezdxf` |
-| `AUTOCAD_MCP_IPC_DIR` | `C:/temp` | Directory for IPC command/result JSON files (must match on both Python and LISP sides) |
+| `AUTOCAD_MCP_IPC_DIR` | `C:/temp` (Windows), `/tmp/autocad_mcp` (Mac) | Directory for IPC command/result JSON files (must match on both Python and LISP sides) |
 | `AUTOCAD_MCP_IPC_TIMEOUT` | `10.0` | IPC command timeout in seconds (1-300) |
 | `AUTOCAD_MCP_ONLY_TEXT` | `false` | Disable screenshot capture (text feedback only) |
 
-> **Note:** If you change `AUTOCAD_MCP_IPC_DIR`, you must also update the `*mcp-ipc-dir*` variable in `mcp_dispatch.lsp` to match.
+> **Note:** `mcp_dispatch.lsp` reads `AUTOCAD_MCP_IPC_DIR` from the operating-system environment when AutoCAD can see it; otherwise it uses the defaults above. If you set the variable only in the MCP client config, AutoCAD will not see it: also set `*mcp-ipc-dir*` in `mcp_dispatch.lsp` (with a trailing `/`).
 
 ## Development
 
@@ -201,9 +268,9 @@ AutoLISP was added to AutoCAD LT in the **2024 release (Windows only)**. AutoCAD
 | All `vl-*` utility functions | `vlax-*` (ActiveX/COM) |
 | File I/O (`open`, `read-line`, etc.) | Express Tools |
 | Entity access (`entget`, `entmod`, etc.) | 3D operations |
-| Selection sets | AutoLISP on Mac |
+| Selection sets | AutoLISP in AutoCAD LT for Mac |
 
-The `mcp_dispatch.lsp` dispatcher is fully compatible with LT 2024+.
+The `mcp_dispatch.lsp` dispatcher is fully compatible with LT 2024+. It uses no `vla-`/`vlax-`/`vlr-` (ActiveX) calls, so the same file loads in full AutoCAD for Mac.
 
 ## What's New in v3.1
 

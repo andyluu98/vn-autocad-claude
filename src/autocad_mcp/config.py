@@ -12,7 +12,9 @@ log = structlog.get_logger()
 
 # Paths
 LISP_DIR = Path(__file__).resolve().parent.parent.parent / "lisp-code"
-IPC_DIR = Path(os.environ.get("AUTOCAD_MCP_IPC_DIR", "C:/temp"))
+# Must match *mcp-ipc-dir* in mcp_dispatch.lsp (C:/temp/ on Windows, /tmp/autocad_mcp/ on Mac)
+_DEFAULT_IPC_DIR = "C:/temp" if sys.platform == "win32" else "/tmp/autocad_mcp"
+IPC_DIR = Path(os.environ.get("AUTOCAD_MCP_IPC_DIR", _DEFAULT_IPC_DIR))
 
 # Backend selection
 BACKEND_DEFAULT = "auto"  # auto | file_ipc | ezdxf
@@ -31,8 +33,9 @@ except ValueError:
     _shot_w = 1400
 SCREENSHOT_MAX_WIDTH = 0 if _shot_w <= 0 else max(320, min(4096, _shot_w))
 
-# Win32 availability
+# Platform availability
 WIN32_AVAILABLE = sys.platform == "win32"
+MACOS_AVAILABLE = sys.platform == "darwin"
 
 
 def _current_backend_env() -> str:
@@ -104,9 +107,22 @@ def detect_backend() -> str:
                         "Install with: pip install pywin32"
                     )
                 log.info("win32_deps_missing_fallback_ezdxf")
+        elif MACOS_AVAILABLE:
+            from autocad_mcp.macos import find_autocad_app
+
+            app = find_autocad_app()
+            if app:
+                log.info("autocad_mac_found", app=app)
+                return "file_ipc"
+            elif backend_env == "file_ipc":
+                raise RuntimeError(
+                    "AUTOCAD_MCP_BACKEND=file_ipc but no AutoCAD for Mac is running. "
+                    "Start AutoCAD (full version; AutoCAD LT for Mac has no AutoLISP) "
+                    "and open a .dwg file."
+                )
         elif backend_env == "file_ipc":
             raise RuntimeError(
-                "AUTOCAD_MCP_BACKEND=file_ipc requires Windows. "
+                "AUTOCAD_MCP_BACKEND=file_ipc requires Windows or macOS. "
                 "Use AUTOCAD_MCP_BACKEND=ezdxf for headless mode."
             )
         elif _is_wsl():

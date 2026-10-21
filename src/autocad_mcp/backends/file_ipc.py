@@ -1,10 +1,12 @@
-"""File-based IPC backend for AutoCAD LT.
+"""File-based IPC backend for AutoCAD / AutoCAD LT (Windows) and AutoCAD for Mac.
 
 Protocol:
-1. Python writes JSON command to C:/temp/autocad_mcp_cmd_{request_id}.json
-2. Python types the fixed string "(c:mcp-dispatch)" + Enter
+1. Python writes JSON command to {IPC_DIR}/autocad_mcp_cmd_{request_id}.json
+   (C:/temp on Windows, /tmp/autocad_mcp on Mac)
+2. Python triggers the dispatcher: "(c:mcp-dispatch)" + Enter on Windows,
+   the MCPD alias typed via System Events on Mac (see autocad_mcp.macos)
 3. LISP reads cmd, dispatches via command map, writes result to
-   C:/temp/autocad_mcp_result_{request_id}.json
+   {IPC_DIR}/autocad_mcp_result_{request_id}.json
 4. Python polls for result file (100ms intervals, 10s timeout)
 """
 
@@ -62,6 +64,7 @@ class FileIPCBackend(AutoCADBackend):
         self._ipc_dir = Path(IPC_DIR)
         self._screenshot_provider = None
         self._acad_com = None  # COM handle for full AutoCAD (preferred trigger)
+        self._mac_app: str | None = None  # e.g. "AutoCAD 2025" on macOS
         self._lock = asyncio.Lock()  # Single in-flight command
 
     @property
@@ -85,26 +88,40 @@ class FileIPCBackend(AutoCADBackend):
 
     async def initialize(self) -> CommandResult:
         """Find AutoCAD window and verify dispatcher is loaded."""
-        self._hwnd = find_autocad_window()
-        if not self._hwnd:
-            return CommandResult(ok=False, error="AutoCAD LT window not found")
+        if sys.platform == "darwin":
+            from autocad_mcp.macos import MacScreenshotProvider, find_autocad_app
 
-        # Set up screenshot provider
-        try:
-            from autocad_mcp.screenshot import Win32ScreenshotProvider
+            self._mac_app = find_autocad_app()
+            if not self._mac_app:
+                return CommandResult(
+                    ok=False,
+                    error=(
+                        "AutoCAD for Mac window not found "
+                        "(full AutoCAD required; AutoCAD LT for Mac has no AutoLISP)"
+                    ),
+                )
+            self._screenshot_provider = MacScreenshotProvider(self._mac_app)
+        else:
+            self._hwnd = find_autocad_window()
+            if not self._hwnd:
+                return CommandResult(ok=False, error="AutoCAD LT window not found")
 
-            self._screenshot_provider = Win32ScreenshotProvider(self._hwnd)
-        except Exception:
-            pass
+            # Set up screenshot provider
+            try:
+                from autocad_mcp.screenshot import Win32ScreenshotProvider
 
-        # Find command-line child edit control for focus-free dispatch
-        self._command_hwnd = self._find_command_line_hwnd()
-        log.info("command_line_hwnd", hwnd=self._command_hwnd)
+                self._screenshot_provider = Win32ScreenshotProvider(self._hwnd)
+            except Exception:
+                pass
 
-        # Full AutoCAD (non-LT) exposes a COM automation object. Using
-        # ActiveDocument.SendCommand is far more reliable than posting WM_CHAR
-        # to the command line, which silently fails on AutoCAD 2025.
-        self._acquire_com()
+            # Find command-line child edit control for focus-free dispatch
+            self._command_hwnd = self._find_command_line_hwnd()
+            log.info("command_line_hwnd", hwnd=self._command_hwnd)
+
+            # Full AutoCAD (non-LT) exposes a COM automation object. Using
+            # ActiveDocument.SendCommand is far more reliable than posting WM_CHAR
+            # to the command line, which silently fails on AutoCAD 2025.
+            self._acquire_com()
 
         # Ensure IPC directory exists
         self._ipc_dir.mkdir(parents=True, exist_ok=True)
@@ -116,21 +133,30 @@ class FileIPCBackend(AutoCADBackend):
         result = await self._dispatch("ping", {})
         if not result.ok:
             lisp_path = str(LISP_DIR / "mcp_dispatch.lsp").replace("\\", "/")
+            mac_hint = (
+                "\nOn Mac also check Accessibility permission for the app running "
+                "this server (System Settings > Privacy & Security > Accessibility)."
+                if self._mac_app else ""
+            )
             return CommandResult(
                 ok=False,
                 error=(
-                    "AutoCAD LT detected but mcp_dispatch.lsp not loaded.\n"
+                    "AutoCAD detected but mcp_dispatch.lsp not loaded.\n"
                     f'In AutoCAD command line, type:\n  (load "{lisp_path}")\n'
                     "Or add lisp-code/ to trusted paths for auto-loading."
+                    f"{mac_hint}"
                 ),
             )
 
-        return CommandResult(ok=True, payload={"backend": "file_ipc", "hwnd": self._hwnd})
+        return CommandResult(
+            ok=True, payload={"backend": "file_ipc", "hwnd": self._hwnd, "mac_app": self._mac_app}
+        )
 
     async def status(self) -> CommandResult:
         info = {
             "backend": "file_ipc",
             "hwnd": self._hwnd,
+            "mac_app": self._mac_app,
             "ipc_dir": str(self._ipc_dir),
             "capabilities": {k: v for k, v in self.capabilities.__dict__.items()},
         }
@@ -238,8 +264,15 @@ class FileIPCBackend(AutoCADBackend):
 
         Prefers COM ActiveDocument.SendCommand (reliable on full AutoCAD).
         Falls back to posting WM_CHAR to the command line for LT, which has
-        no COM automation interface.
+        no COM automation interface. On macOS, types the MCPD alias into
+        AutoCAD for Mac via System Events.
         """
+        if self._mac_app:
+            from autocad_mcp.macos import send_trigger
+
+            send_trigger(self._mac_app)
+            return
+
         # Preferred path: COM SendCommand (full AutoCAD)
         if self._acad_com is not None:
             try:
